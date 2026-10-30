@@ -1,134 +1,83 @@
+"""CM-DA-SSM · SLAKE Stage 2 Validation/Test 配置。
+
+继承真实的五组消融 Stage2TrainConfig，因此：
+  * 不再使用旧 MoRA-Med 的 A0～A6、Gate、Scale 等参数；
+  * 评测严格使用该组 Stage 2 的权重目录和 Stage 1 来源；
+  * Validation 选择最佳 checkpoint，Test 可以只读取这一节点。
+
+运行参数：
+  --ablation_id A3 --seed 2048 --stage1_seed 2048
+  --run_tag main --stage1_run_tag main
+"""
+
+from __future__ import annotations
+
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from config.slake.stage2_train_config_slake import Stage2TrainConfig
 
 
 @dataclass
 class Stage2EvalConfig(Stage2TrainConfig):
-    """
-    SLAKE Stage 2 checkpoint 评测配置。
+    """与 Stage 2 正式训练共享所有架构、路径和消融参数。"""
 
-    直接继承 Stage2TrainConfig，确保：
-    - A0～A5 消融定义一致；
-    - LoRA 结构一致；
-    - RoMA-Net V2-lite 结构一致；
-    - Stage 2 权重目录命名一致。
-    """
-    # =========================================================
-    # Test checkpoint 选择方式
-    # =========================================================
-
-    # "best_validation":
-    #   读取 Validation 评测生成的 best_checkpoint.json，
-    #   只测试 Validation 最佳节点。
-    #
-    # "all":
-    #   在 Test 上评测全部 checkpoint-* + final_weights。
+    # Test 默认只读取 Validation 选择的最佳节点；禁止用 Test 选最佳。
     test_checkpoint_mode: str = "best_validation"
 
-    # 必须对应要评测的 Stage 2 实验
-    ablation_id: str = "A0" #"A1" #"A2" #"A3" #"A4" #"A5" #"A6" #"A0" #"A0" #"A5"
-
-    # 当前评测 A6
-    # use_discriminative_lr: bool = True
-    # stage1_use_discriminative_lr: bool = True
-    #为A0,A1择为False
-    use_discriminative_lr: bool = False
-    stage1_use_discriminative_lr: bool = False
-
-    # Stage 2 训练种子
-    seed: int = 1024 #4096 #1024 #4096 #1024 #2048
-
-    # Stage 1 来源权重的种子
-    stage1_seed: int = 1024 #4096 #1024 #4096 #1024 #2048
-
-    # True: 只评测 final_weights
-    # False: 评测 checkpoint-* 和 final_weights
+    # False：Validation 评测全部完整 checkpoint-* 和 final_weights；
+    # True：仅评测最终权重。若已有多个 checkpoint，建议 False。
     eval_final_weights_only: bool = False
 
-    # 评测结果根目录
-    eval_output_root: str = (
-        "/home/yuqing/Models/MoRA_Med/Eval_SLAKE"
-    )
+    # 不覆盖训练 seed / stage1_seed / ablation_id，继承训练配置的 CLI。
+    eval_output_root: str = "/home/yuqing/Models/CM_DA_SSM/Eval_SLAKE"
 
-    # 生成参数
+    # 保持原 MoRA-Med 的 LLM Judge 评测协议。
+    # strict_only=True 可进行纯本地字符串匹配冒烟测试，
+    # 但它与 LLM Judge 的正式 Overall 指标不可直接比较。
+    strict_only: bool = False
     max_new_tokens: int = 64
     do_sample: bool = False
     temperature: float = 0.0
-
-    # DataLoader
     per_device_eval_batch_size: int = 4
     dataloader_num_workers: int = 4
 
-    def __post_init__(self):
+    stage2_run_dir: str = field(init=False)
+    eval_run_dir: str = field(init=False)
+    validation_output_dir: str = field(init=False)
+    test_output_dir: str = field(init=False)
+    best_checkpoint_path: str = field(init=False)
+
+    def __post_init__(self) -> None:
         super().__post_init__()
 
-        valid_test_checkpoint_modes = {
-            "best_validation",
-            "all",
-        }
-
-        if (
-                self.test_checkpoint_mode
-                not in valid_test_checkpoint_modes
-        ):
+        if self.test_checkpoint_mode not in {"best_validation", "all"}:
             raise ValueError(
-                "test_checkpoint_mode 必须是 "
-                "'best_validation' 或 'all'，"
-                f"当前为 {self.test_checkpoint_mode!r}。"
+                "test_checkpoint_mode 只能为 'best_validation' 或 'all'。"
             )
 
         self.stage2_run_dir = self.output_dir
 
-        run_name = os.path.basename(
-            os.path.normpath(
-                self.stage2_run_dir
-            )
+        # 不能只取最后的 run_main，因为不同架构 / LR / seed
+        # 都可能有 run_main，评测结果会相互覆盖。
+        relative_run_dir = os.path.relpath(
+            self.stage2_run_dir, self.output_root,
         )
+        if relative_run_dir.startswith("..") or os.path.isabs(relative_run_dir):
+            raise ValueError("Stage 2 训练目录不能位于 output_root 外。")
 
-        # 当前 Stage 2 实验的统一评测根目录。
         self.eval_run_dir = os.path.join(
             self.eval_output_root,
-            run_name,
+            relative_run_dir,
         )
-
-        # Validation 和 Test 分开保存，避免结果互相覆盖。
         self.validation_output_dir = os.path.join(
-            self.eval_run_dir,
-            "validation",
+            self.eval_run_dir, "validation",
         )
-
         self.test_output_dir = os.path.join(
-            self.eval_run_dir,
-            "test",
+            self.eval_run_dir, "test",
         )
-
-        # Validation 脚本生成，Test(best_validation) 模式读取。
         self.best_checkpoint_path = os.path.join(
-            self.validation_output_dir,
-            "best_checkpoint.json",
+            self.validation_output_dir, "best_checkpoint.json",
         )
 
-        print("\n" + "=" * 60)
-        print(
-            "SLAKE Stage 2 评测配置"
-            f" | 消融={self.ablation_id}"
-        )
-        print(
-            f"Stage 2 训练目录："
-            f"{self.stage2_run_dir}"
-        )
-        print(
-            f"Validation 输出目录："
-            f"{self.validation_output_dir}"
-        )
-        print(
-            f"Test 输出目录："
-            f"{self.test_output_dir}"
-        )
-        print(
-            f"Test checkpoint mode："
-            f"{self.test_checkpoint_mode}"
-        )
-        print("=" * 60 + "\n")
+        # Eval 不应覆盖继承来的 self.output_dir：仍表示 Stage 2 训练目录。

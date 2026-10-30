@@ -1,1096 +1,590 @@
+"""CM-DA-SSM Stage 2 · SLAKE Validation。
+
+本文件保留原项目的评测入口与核心协议：
+  1. Validation 对各 checkpoint 执行医学 VQA 生成；
+  2. CLOSED：答案规范化后的严格匹配；
+  3. OPEN：严格匹配失败时使用原 DeepSeek LLM Judge；
+  4. 输出逐样本 JSONL/CSV、summary、leaderboard；
+  5. 在 Validation 上选定最佳 checkpoint，供 Test 使用。
+
+与 MoRA-Med 不同：
+  - 只使用 Qwen3VLLoraAndCMDASSMWrapper，加载新的 LoRA + visual_adapter.pt；
+  - BioMedCLIP 仅在 A2/A3/A3-NoRMS 使用；A1 是 Uniform Fusion；
+  - 记录四方向 RF/RR/CF/CR、全局 λ、逐图 ρ 和注入幅度；
+  - DeepStack 依旧由 Qwen3-VL 原生处理，不参与 CM-DA-SSM。
+
+诊断的捕捉通过 eval 期间临时包装 Adapter.forward(return_details=True)
+实现；它不修改模型参数或 forward 的输出张量。正式训练无需该包装。
+"""
+
+from __future__ import annotations
+
+import argparse
 import csv
-import glob
+import hashlib
 import json
 import math
 import os
+import re
+import sys
 import types
+from pathlib import Path
+from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
-from peft import set_peft_model_state_dict
-from safetensors.torch import load_file
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from config.LLM_config import LLMAPIConfig
 from config.slake.stage2_eval_config_slake import Stage2EvalConfig
 from datas.slake_datasets import SLAKEDataset
-from LLM_api.deepseek import DeepSeekClient
-from LLM_api.prompts.slake_prompt_builder_deepseek import (
-    build_llm_judge_user_prompt,
-    parse_llm_judge_response,
-)
-from utils.biomedclip.biomed_clip_loader import load_biomedclip
 from utils.data_tools.collator.slake.slake_datasets_eval_collator import (
     SLAKEEvalCollator,
 )
 from utils.data_tools.prompt_cleaning.slake_answer_cleaning import (
     slake_answer_eval_cleaning,
 )
-from utils.qwen3vl.qwen3_vl_8B_lora_wrapper import (
-    Qwen3VLLoraAndVisualAdapterWrapper,
+from utils.qwen3vl.qwen3_vl_8B_four_directional_ssm_utils import (
+    DIRECTION_NAMES,
 )
-from utils.qwen3vl.qwen3_vl_8B_quant_loader import Qwen3VLQuantizedLoader
+from utils.training.stage1_checkpoint_utils import (
+    get_visual_adapter,
+    restore_visual_adapter_strict,
+)
 
 
-def get_adapter(model):
-    """
-    获取挂载在 Qwen3-VL 视觉塔中的 Visual Adapter。
-
-    当前模型层级为：
-    PEFT model
-      -> base_model
-      -> model
-      -> model
-      -> visual
-      -> res_adapter
-    """
-    return model.base_model.model.model.visual.res_adapter
+DIAGNOSTIC_DIRECTIONS = tuple(DIRECTION_NAMES)
+if len(DIAGNOSTIC_DIRECTIONS) != 4:
+    raise RuntimeError("CM-DA-SSM 的四方向名称不正确。")
 
 
-def build_model(weights_path, loader, cfg, biomed_extractor):
-    """
-    为指定 checkpoint 重建完整模型，并加载：
-
-    1. Qwen3-VL 4-bit 底座；
-    2. 当前 Stage 2 checkpoint 的 LoRA；
-    3. 当前 Stage 2 checkpoint 的 Visual Adapter。
-
-    每个 checkpoint 都从干净底座重新构建，避免不同 checkpoint
-    之间残留参数或状态。
-    """
-    base_model = loader.load_model()
-
-    # 使用与训练阶段完全一致的 Wrapper 重建模型结构。
-    wrapper = Qwen3VLLoraAndVisualAdapterWrapper(
-        # LoRA 配置。
-        lora_r=cfg.lora_r,
-        lora_alpha=cfg.lora_alpha,
-        lora_dropout=cfg.lora_dropout,
-        lora_target_modules=cfg.lora_target_modules,
-        gradient_checkpointing=False,
-
-        # Visual Adapter 配置。
-        visual_adapter_hidden_dim=cfg.visual_adapter_hidden_dim,
-        visual_adapter_r=cfg.visual_adapter_r,
-        enable_visual_adapter=cfg.enable_visual_adapter,
-
-        # BioMedCLIP 路由条件。
-        biomed_extractor=biomed_extractor,
-        use_cross_modal_prior=cfg.use_cross_modal_prior,
-
-        # Router 配置。
-        router_hidden_dim=cfg.router_hidden_dim,
-        scale_mode=cfg.scale_mode,
-        fixed_scale_weights=cfg.fixed_scale_weights,
-
-        # 样本级 residual gate。
-        gate_mode=cfg.gate_mode,
-        fixed_gate=cfg.fixed_gate,
-        gate_init=cfg.gate_init,
-
-        # 全局残差系数 lambda。
-        lambda_mode=cfg.lambda_mode,
-        fixed_lambda=cfg.fixed_lambda,
-        lambda_max=cfg.lambda_max,
-        lambda_init=cfg.lambda_init,
-
-        # Visual residual RMS 对齐。
-        use_rms_norm=cfg.use_rms_norm,
-        residual_norm_eps=cfg.residual_norm_eps,
-        residual_norm_ratio_clip=cfg.residual_norm_ratio_clip,
+def read_options() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--check_config_only", action="store_true")
+    parser.add_argument(
+        "--strict_only", action="store_true",
+        help="仅用于本地评测/调试；不调用 DeepSeek，不能和 LLM-Judge 正式指标直接比较。",
     )
-
-    model = wrapper.wrap(base_model)
-
-    # 加载当前 checkpoint 的 LoRA 参数。
-    set_peft_model_state_dict(
-        model,
-        load_file(
-            os.path.join(
-                weights_path,
-                "adapter_model.safetensors",
-            )
-        ),
-    )
-
-    # A0 不启用 Visual Adapter，因此不加载 visual_adapter.pt。
-    if cfg.enable_visual_adapter:
-        state = torch.load(
-            os.path.join(
-                weights_path,
-                "visual_adapter.pt",
-            ),
-            map_location="cpu",
-        )
-
-        # strict=True：结构或参数名不一致时立即报错。
-        get_adapter(model).load_state_dict(
-            state,
-            strict=True,
-        )
-
-    # 评测阶段关闭梯度与 gradient checkpointing，并开启 KV cache。
-    model.requires_grad_(False)
-    model.gradient_checkpointing_disable()
-    model.config.use_cache = True
-    model.eval()
-
-    return model, base_model
+    options, _ = parser.parse_known_args()
+    return options
 
 
-def patch_generate_forward(model):
-    """
-    generate() 会连续多次调用 model.forward()。
-
-    BioMedCLIP 特征已经在每个 batch 生成前计算并缓存到 vision_tower，
-    因此这里移除原始 BioMedCLIP 输入，避免每生成一个 token
-    都重复执行 BioMedCLIP 编码。
-    """
-    def forward(self, *args, **kwargs):
-        kwargs.pop(
-            "biomed_image_tensors",
-            None,
-        )
-        kwargs.pop(
-            "biomed_text_tokens",
-            None,
-        )
-
-        # original_forward 是 Wrapper 保存的 PEFT/Qwen 原始 forward。
-        return self.original_forward(
-            *args,
-            **kwargs,
-        )
-
-    model.forward = types.MethodType(
-        forward,
-        model,
-    )
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for piece in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(piece)
+    return digest.hexdigest()
 
 
-def evaluate_checkpoint(
-    weights_path,
-    loader,
-    processor,
-    cfg,
-    val_loader,
-    llm_client,
-    llm_cfg,
-    biomed_extractor,
-):
-    """
-    完成单个 checkpoint 的完整评测：
-
-    1. 重建并加载模型；
-    2. 在 SLAKE validation 上本地生成答案；
-    3. 记录每条样本的 Router / Gate / Lambda；
-    4. 对开放题未严格匹配样本执行 LLM Judge；
-    5. 计算 Closed / Open / Overall Accuracy；
-    6. 保存逐样本 JSONL、CSV 和 summary.json。
-    """
-    name = os.path.basename(weights_path)
-
-    # 每个 checkpoint 拥有独立输出目录。
-    output_dir = os.path.join(
-        cfg.validation_output_dir,
-        name,
-    )
-    os.makedirs(
-        output_dir,
-        exist_ok=True,
-    )
-
-    print("\n" + "=" * 60)
-    print(f"开始评测：{name}")
-    print(f"输出目录：{output_dir}")
-    print("=" * 60)
-
-    model, base_model = build_model(
-        weights_path,
-        loader,
-        cfg,
-        biomed_extractor,
-    )
-
-    # A0 没有 Visual Adapter，其余消融读取对应模块。
-    adapter = (
-        get_adapter(model)
-        if cfg.enable_visual_adapter
-        else None
-    )
-
-    # Qwen3-VL 视觉塔，用于写入和清空 BioMedCLIP 缓存。
-    vision_tower = (
-        model.base_model
-        .model
-        .model
-        .visual
-    )
-
-    # 以视觉塔参数所在设备和 dtype 为准。
-    ref_param = next(
-        vision_tower.parameters()
-    )
-    device = ref_param.device
-    adapter_dtype = ref_param.dtype
-
-    if cfg.enable_visual_adapter:
-        patch_generate_forward(model)
-
-    # 保存所有图文对的预测、标准答案和路由诊断。
-    records = []
-
-    # =========================================================
-    # Phase 1：本地生成
-    # =========================================================
-    with torch.no_grad():
-        for batch_inputs, metadata in tqdm(
-            val_loader,
-            desc="Local Inference",
-        ):
-            # 将 Tensor 输入移动到模型所在设备。
-            inputs = {
-                key: (
-                    value.to(device)
-                    if isinstance(value, torch.Tensor)
-                    else value
-                )
-                for key, value in batch_inputs.items()
-            }
-
-            if cfg.enable_visual_adapter:
-                # BioMedCLIP 图像使用模型浮点 dtype；
-                # 文本 token 保持整数 dtype。
-                image = inputs.pop(
-                    "biomed_image_tensors"
-                ).to(adapter_dtype)
-
-                text = inputs.pop(
-                    "biomed_text_tokens"
-                )
-
-                # 每个 batch 只计算一次 BioMedCLIP 图像和文本特征。
-                image_feat, text_feat = (
-                    model.biomed_extractor(
-                        image,
-                        text,
-                    )
-                )
-
-                # 缓存到视觉塔，供 generate() 内部多次 forward 复用。
-                vision_tower.current_biomed_img_feat = (
-                    image_feat
-                )
-                vision_tower.current_biomed_txt_feat = (
-                    text_feat
-                )
-
-            # 贪心解码时只传必要参数。
-            generate_args = {
-                "max_new_tokens": (
-                    cfg.max_new_tokens
-                ),
-                "do_sample": cfg.do_sample,
-            }
-
-            if cfg.do_sample:
-                generate_args["temperature"] = (
-                    cfg.temperature
-                )
-
-            generated = model.generate(
-                **inputs,
-                **generate_args,
-            )
-
-            if cfg.enable_visual_adapter:
-                # Fusion 前向会保存当前 batch 的路由结果。
-                #
-                # routing: [B, 3]，依次对应 F3 / F5 / F7。
-                # gate:    [B]，每个图文对一个样本级 Gate。
-                # lambda:  标量，全局共享。
-                routing = (
-                    adapter
-                    .latest_routing_weights
-                    .detach()
-                    .float()
-                    .cpu()
-                )
-
-                gate = (
-                    adapter
-                    .latest_soft_gate
-                    .detach()
-                    .float()
-                    .reshape(-1)
-                    .cpu()
-                )
-
-                lambda_value = float(
-                    adapter
-                    .latest_lambda
-                    .detach()
-                    .float()
-                    .cpu()
-                    .item()
-                )
-
-                batch_size = len(metadata)
-
-                # 若维度不符合当前三专家设计，直接终止评测。
-                if routing.shape != (
-                    batch_size,
-                    3,
-                ):
-                    raise RuntimeError(
-                        f"routing shape="
-                        f"{tuple(routing.shape)}, "
-                        f"expected=({batch_size}, 3)"
-                    )
-
-                if gate.shape != (
-                    batch_size,
-                ):
-                    raise RuntimeError(
-                        f"gate shape="
-                        f"{tuple(gate.shape)}, "
-                        f"expected=({batch_size},)"
-                    )
-
-                # 当前 batch 使用结束后清空缓存，
-                # 防止特征错误复用到下一批样本。
-                vision_tower.current_biomed_img_feat = (
-                    None
-                )
-                vision_tower.current_biomed_txt_feat = (
-                    None
-                )
-
-            else:
-                routing = None
-                gate = None
-                lambda_value = None
-
-            # model.generate() 返回：
-            # [输入 prompt token + 新生成 token]。
-            # 这里只保留新生成的答案部分。
-            generated = [
-                output[len(input_ids):]
-                for input_ids, output in zip(
-                    inputs["input_ids"],
-                    generated,
-                )
-            ]
-
-            predictions = processor.batch_decode(
-                generated,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )
-
-            # 将当前 batch 拆成逐样本记录。
-            for i, prediction in enumerate(
-                predictions
-            ):
-                meta = metadata[i]
-
-                gt_raw = meta.get(
-                    "gt_answer",
-                    meta.get("answer", ""),
-                )
-
-                # 统一清洗 GT 和预测答案后进行严格匹配。
-                gt_norm = (
-                    slake_answer_eval_cleaning(
-                        gt_raw
-                    )
-                )
-                pred_norm = (
-                    slake_answer_eval_cleaning(
-                        prediction
-                    )
-                )
-                matched = (
-                    pred_norm == gt_norm
-                )
-
-                # SLAKE 中 CLOSED 通常对应 yes/no 等封闭式问题；
-                # 其余归为 OPEN。
-                category = (
-                    "closed"
-                    if (
-                        meta.get(
-                            "answer_type",
-                            "",
-                        )
-                        .strip()
-                        .upper()
-                        == "CLOSED"
-                    )
-                    else "open"
-                )
-
-                record = {
-                    "index": meta.get("index"),
-                    "image_path": meta.get(
-                        "image_path"
-                    ),
-                    "question": meta["question"],
-                    "question_category": category,
-
-                    # 原始答案和清洗后的答案。
-                    "gt_raw": gt_raw,
-                    "gt_norm": gt_norm,
-                    "pred_raw": prediction.strip(),
-                    "pred_norm": pred_norm,
-
-                    # 本地字符串严格匹配结果。
-                    "is_norm_match": matched,
-
-                    # 开放题未严格匹配时，由 LLM Judge 补充。
-                    "llm_judge_score": None,
-                    "llm_judge_reason": None,
-                    "llm_judge_raw_response": None,
-
-                    # 默认使用严格匹配结果；
-                    # LLM Judge 后可能被更新。
-                    "final_correct": matched,
-
-                    # A0 中以下诊断字段保持 None。
-                    "routing_f3": None,
-                    "routing_f5": None,
-                    "routing_f7": None,
-                    "residual_gate": None,
-                    "lambda_value": None,
-                    "effective_residual_scale": None,
-                }
-
-                if routing is not None:
-                    record["routing_f3"] = float(
-                        routing[i, 0]
-                    )
-                    record["routing_f5"] = float(
-                        routing[i, 1]
-                    )
-                    record["routing_f7"] = float(
-                        routing[i, 2]
-                    )
-
-                    record["residual_gate"] = float(
-                        gate[i]
-                    )
-                    record["lambda_value"] = (
-                        lambda_value
-                    )
-
-                    # 当前样本实际使用的整体残差系数。
-                    record[
-                        "effective_residual_scale"
-                    ] = (
-                        lambda_value
-                        * float(gate[i])
-                    )
-
-                records.append(record)
-
-    # 本地生成结束后释放大模型显存。
-    del model
-    del base_model
-    torch.cuda.empty_cache()
-
-    # =========================================================
-    # Phase 2：LLM Judge
-    # =========================================================
-    for record in tqdm(
-        records,
-        desc="LLM Judging",
+def validate_stage2_checkpoint(path: str | Path, cfg: Stage2EvalConfig) -> dict:
+    """验证权重来源、架构与 Visual Adapter 哈希；拒绝旧 MoRA-Med 目录。"""
+    p = Path(path).resolve()
+    root = Path(cfg.stage2_run_dir).resolve()
+    if p.parent != root or not (
+        p.name == "final_weights"
+        or re.fullmatch(r"checkpoint-\d+", p.name)
     ):
-        # Closed 问题只使用严格匹配；
-        # Open 问题严格匹配失败时才调用 LLM Judge。
-        if (
-            record["question_category"]
-            == "open"
-            and not record["is_norm_match"]
-        ):
-            prompt = build_llm_judge_user_prompt(
-                question=record["question"],
-                gt_raw=record["gt_raw"],
-                gt_norm=record["gt_norm"],
-                pred_raw=record["pred_raw"],
-                pred_norm=record["pred_norm"],
-            )
+        raise RuntimeError(f"权重目录不属于当前 SLAKE Stage 2 运行：{p}")
 
-            response = llm_client.ask(
-                llm_cfg.medical_vqa_llm_judge_system_prompt,
-                prompt,
-            )
-
-            judged = parse_llm_judge_response(
-                response
-            )
-
-            record[
-                "llm_judge_raw_response"
-            ] = response
-
-            record["llm_judge_score"] = (
-                judged["score"]
-            )
-            record["llm_judge_reason"] = (
-                    judged.get("reasoning")
-                    or judged.get("reason")
-                    or judged.get("explanation")
-            )
-
-            # 当前 strict 指标只把 correct 计为正确；
-            # partially_correct 不计入最终准确率。
-            record["final_correct"] = (
-                judged["score"] == "correct"
-            )
-
-    # =========================================================
-    # Phase 3：准确率统计
-    # =========================================================
-    closed = [
-        item
-        for item in records
-        if (
-            item["question_category"]
-            == "closed"
+    manifest_path = p / "stage2_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"缺少 CM-DA-SSM Stage 2 manifest：{manifest_path}。"
+            "不要使用旧 MoRA-Med checkpoint。"
         )
-    ]
-
-    opened = [
-        item
-        for item in records
-        if (
-            item["question_category"]
-            == "open"
-        )
-    ]
-
-    closed_correct = sum(
-        item["final_correct"]
-        for item in closed
-    )
-
-    open_correct = sum(
-        item["final_correct"]
-        for item in opened
-    )
-
-    result = {
-        "checkpoint": name,
-        "checkpoint_path": os.path.abspath(
-            weights_path
-        ),
-        "closed_acc": (
-            closed_correct / len(closed)
-        ),
-        "open_strict_acc": (
-            open_correct / len(opened)
-        ),
-        "overall_strict_acc": (
-            closed_correct
-            + open_correct
-        ) / len(records),
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    expected = {
+        "format_version": "CM-DA-SSM-STAGE2-SLAKE-V1",
+        "dataset": "SLAKE",
+        "ablation_id": cfg.ablation_id,
+        "architecture_fingerprint": cfg.architecture_fingerprint,
+        "stage1_weights_dir": cfg.stage1_weights_dir,
+        "seed": cfg.seed,
+        "stage1_seed": cfg.stage1_seed,
+        "run_tag": cfg.run_tag,
+        "stage1_run_tag": cfg.stage1_run_tag,
     }
-
-    # =========================================================
-    # Phase 4：Router / Gate / Lambda 诊断
-    # =========================================================
-    if cfg.enable_visual_adapter:
-        # 将逐样本记录重新整理为 Tensor，计算整体统计。
-        routing = torch.tensor(
-            [
-                [
-                    item["routing_f3"],
-                    item["routing_f5"],
-                    item["routing_f7"],
-                ]
-                for item in records
-            ]
-        )
-
-        gates = torch.tensor(
-            [
-                item["residual_gate"]
-                for item in records
-            ]
-        )
-
-        effective = torch.tensor(
-            [
-                item[
-                    "effective_residual_scale"
-                ]
-                for item in records
-            ]
-        )
-
-        # H(w) = -sum(w * log(w))。
-        # 三专家最大熵为 log(3)。
-        safe_routing = routing.clamp_min(
-            1e-12
-        )
-        entropy = -(
-            safe_routing
-            * safe_routing.log()
-        ).sum(dim=-1)
-
-        mean_weights = routing.mean(
-            dim=0
-        )
-
-        gate_q = torch.quantile(
-            gates,
-            torch.tensor(
-                [0.1, 0.5, 0.9]
-            ),
-        )
-
-        effective_q = torch.quantile(
-            effective,
-            torch.tensor(
-                [0.1, 0.5, 0.9]
-            ),
-        )
-
-        # 同时写入 summary.json。
-        result["routing"] = {
-            "mean_f3": float(
-                mean_weights[0]
-            ),
-            "mean_f5": float(
-                mean_weights[1]
-            ),
-            "mean_f7": float(
-                mean_weights[2]
-            ),
-            "gate_mean": float(
-                gates.mean()
-            ),
-            "gate_std": float(
-                gates.std(
-                    unbiased=False
-                )
-            ),
-            "lambda": records[0][
-                "lambda_value"
-            ],
-            "effective_mean": float(
-                effective.mean()
-            ),
-            "effective_std": float(
-                effective.std(
-                    unbiased=False
-                )
-            ),
-            "entropy_mean": float(
-                entropy.mean()
-            ),
-            "entropy_normalized": float(
-                entropy.mean()
-                / math.log(3)
-            ),
-        }
-
-        print("\n" + "=" * 70)
-        print(
-            "三尺度路由诊断 | "
-            f"checkpoint={name}"
-        )
-        print("=" * 70)
-
-        print(
-            "平均专家权重："
-            f"F3={mean_weights[0]:.6f}, "
-            f"F5={mean_weights[1]:.6f}, "
-            f"F7={mean_weights[2]:.6f}"
-        )
-
-        print(
-            "residual gate："
-            f"mean={gates.mean():.6f}, "
-            f"std="
-            f"{gates.std(unbiased=False):.6f}, "
-            f"P10={gate_q[0]:.6f}, "
-            f"P50={gate_q[1]:.6f}, "
-            f"P90={gate_q[2]:.6f}"
-        )
-
-        print(
-            f"lambda："
-            f"{records[0]['lambda_value']:.6f}"
-        )
-
-        print(
-            "lambda × gate："
-            f"mean={effective.mean():.6f}, "
-            f"std="
-            f"{effective.std(unbiased=False):.6f}, "
-            f"P10={effective_q[0]:.6f}, "
-            f"P50={effective_q[1]:.6f}, "
-            f"P90={effective_q[2]:.6f}"
-        )
-
-        print(
-            "路由 entropy："
-            f"mean={entropy.mean():.6f}, "
-            f"归一化="
-            f"{entropy.mean() / math.log(3):.6f}"
-        )
-
-        print("=" * 70)
-
-    # =========================================================
-    # Phase 5：输出逐样本记录和汇总结果
-    # =========================================================
-
-    # JSONL：一行一个样本，适合后续 Python 逐行读取。
-    jsonl_path = os.path.join(
-        output_dir,
-        "samples.jsonl",
-    )
-
-    with open(
-        jsonl_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        for record in records:
-            file.write(
-                json.dumps(
-                    record,
-                    ensure_ascii=False,
-                )
-                + "\n"
+    for key, value in expected.items():
+        if manifest.get(key) != value:
+            raise RuntimeError(
+                f"Stage 2 checkpoint 字段 {key} 不匹配："
+                f"expected={value!r} actual={manifest.get(key)!r}"
             )
+    if manifest.get("architecture_parameters") != cfg.architecture_parameters():
+        raise RuntimeError("Stage 2 checkpoint 完整架构配置不匹配。")
 
-    # CSV：方便 Excel、Pandas 或统计软件查看。
-    csv_path = os.path.join(
-        output_dir,
-        "samples.csv",
-    )
+    if not (p / "adapter_config.json").is_file():
+        raise FileNotFoundError(f"缺少 LoRA adapter_config.json：{p}")
+    lora_files = [
+        file for name in ("adapter_model.safetensors", "adapter_model.bin")
+        if (file := p / name).is_file()
+    ]
+    if len(lora_files) != 1:
+        raise RuntimeError(f"需要唯一的 Stage 2 LoRA 权重：{p}")
 
-    with open(
-        csv_path,
-        "w",
-        encoding="utf-8-sig",
-        newline="",
-    ) as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=list(
-                records[0].keys()
+    visual_path = p / "visual_adapter.pt"
+    if cfg.enable_visual_adapter:
+        if not visual_path.is_file():
+            raise FileNotFoundError(f"缺少 Stage 2 Visual Adapter：{visual_path}")
+        if manifest.get("visual_adapter_sha256") != _file_sha256(visual_path):
+            raise RuntimeError(f"Stage 2 Visual Adapter SHA256 不匹配：{p}")
+    elif visual_path.exists():
+        raise RuntimeError("A0 checkpoint 不应包含 Visual Adapter。")
+    return manifest
+
+
+def discover_checkpoints(cfg: Stage2EvalConfig) -> list[Path]:
+    """Validation 中候选列表固定，仅使用本次 Stage 2 实验目录。"""
+    root = Path(cfg.stage2_run_dir)
+    if cfg.eval_final_weights_only:
+        names = [root / "final_weights"]
+    else:
+        names = sorted(
+            (
+                item for item in root.glob("checkpoint-*")
+                if item.is_dir() and re.fullmatch(r"checkpoint-\d+", item.name)
             ),
+            key=lambda p: int(p.name.split("-")[-1]),
         )
-        writer.writeheader()
-        writer.writerows(records)
+        final_path = root / "final_weights"
+        if final_path.is_dir():
+            names.append(final_path)
+    if not names:
+        raise FileNotFoundError(f"没有发现 SLAKE Stage 2 checkpoint：{root}")
+    for name in names:
+        validate_stage2_checkpoint(name, cfg)
+    return names
 
-    # 当前 checkpoint 的整体指标与路由统计。
-    summary_path = os.path.join(
-        output_dir,
-        "summary.json",
-    )
 
-    with open(
-        summary_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            result,
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
+def _install_generation_forward(model) -> None:
+    """generate() 中使用预先缓存的 BioMedCLIP，不重复计算，也不清空缓存。"""
+    if not hasattr(model, "original_forward"):
+        raise RuntimeError("CM-RADF Wrapper 未安装 original_forward patch。")
 
-    print(
-        f"逐样本 JSONL："
-        f"{jsonl_path}"
-    )
-    print(
-        f"逐样本 CSV："
-        f"{csv_path}"
-    )
-    print(
-        f"汇总 JSON："
-        f"{summary_path}"
-    )
+    def forward(self, *args, **kwargs):
+        kwargs.pop("biomed_image_tensors", None)
+        kwargs.pop("biomed_text_tokens", None)
+        return self.original_forward(*args, **kwargs)
 
+    model.forward = types.MethodType(forward, model)
+
+
+def _enable_adapter_diagnostics(adapter):
+    """只在推理时捕捉四方向诊断，保留原 Adapter 的输出 Tensor。"""
+    original = adapter.forward
+    holder: dict[str, list[dict]] = {"details": []}
+
+    def wrapped(self, *args, **kwargs):
+        kwargs.pop("return_details", None)
+        enhanced, details = original(*args, return_details=True, **kwargs)
+        holder["details"] = [
+            {
+                "routing_weights": value["routing_weights"].detach().float().cpu(),
+                "rho": value["rho"].detach().float().cpu(),
+                "lambda": value["lambda"].detach().float().cpu(),
+                "delta_rms": value["delta_rms"].detach().float().cpu(),
+            }
+            for value in details
+        ]
+        return enhanced
+
+    adapter.forward = types.MethodType(wrapped, adapter)
+    return holder, original
+
+
+def _stats_for_image(detail: dict) -> dict:
+    """按 token 平均四方向权重，单张图像分别记录 λ、ρ 和残差幅度。"""
+    beta = detail["routing_weights"]
+    if beta.ndim != 3 or beta.size(0) != 1 or beta.size(-1) != 4:
+        raise RuntimeError(f"四方向 routing_weights 形状错误：{tuple(beta.shape)}")
+    mean = beta.mean(dim=(0, 1))
+    entropy = -(
+        beta.clamp_min(1e-12) * beta.clamp_min(1e-12).log()
+    ).sum(dim=-1).mean()
+    result = {
+        f"direction_{name.lower()}": float(mean[i].item())
+        for i, name in enumerate(DIAGNOSTIC_DIRECTIONS)
+    }
+    lam = float(detail["lambda"].item())
+    rho = float(detail["rho"].item())
+    result.update({
+        "lambda_value": lam,
+        "rho": rho,
+        "lambda_times_rho": lam * rho,
+        "injected_residual_rms": float(detail["delta_rms"].item()),
+        "routing_entropy": float(entropy.item()),
+        "routing_entropy_normalized": float(entropy.item() / math.log(4)),
+    })
     return result
 
 
-def get_checkpoints(cfg):
-    final_weights = os.path.join(
-        cfg.stage2_run_dir,
-        "final_weights",
+def build_model_for_checkpoint(cfg: Stage2EvalConfig, checkpoint: Path):
+    """重建干净 Qwen3-VL/PEFT，并严格加载 Stage 2 当前 checkpoint 的权重。"""
+    from utils.qwen3vl.qwen3_vl_8B_quant_loader import Qwen3VLQuantizedLoader
+    from utils.qwen3vl.qwen3_vl_8B_cm_da_ssm_lora_wrapper import (
+        Qwen3VLLoraAndCMDASSMWrapper,
     )
+    from training.stage2_trainer_slake import _load_lora_strict
 
-    checkpoints = glob.glob(
-        os.path.join(
-            cfg.stage2_run_dir,
-            "checkpoint-*",
-        )
-    )
+    validate_stage2_checkpoint(checkpoint, cfg)
 
-    checkpoints.sort(
-        key=lambda path: int(
-            path.rsplit("-", 1)[-1]
-        )
-    )
-
-    checkpoints.append(
-        final_weights
-    )
-
-    return checkpoints
-
-
-def main():
-    cfg = Stage2EvalConfig()
-
-    # 创建当前实验统一评测目录。
-    os.makedirs(
-        cfg.validation_output_dir,
-        exist_ok=True,
-    )
-
-    checkpoints = get_checkpoints(
-        cfg
-    )
-
-    print(
-        f"发现 {len(checkpoints)} "
-        "个评测节点："
-    )
-
-    for path in checkpoints:
-        print(
-            f"  - {os.path.basename(path)}"
-        )
-
-    # =========================================================
-    # 1. Qwen3-VL Loader 与 Processor
-    # =========================================================
     loader = Qwen3VLQuantizedLoader(
         model_path=cfg.model_name_or_path,
         processor_path=cfg.model_name_or_path,
         load_in_4bit=cfg.load_in_4bit,
-        bnb_4bit_quant_type=(
-            cfg.bnb_4bit_quant_type
-        ),
-        bnb_4bit_use_double_quant=(
-            cfg.bnb_4bit_use_double_quant
-        ),
-        bnb_4bit_compute_dtype=(
-            cfg.bnb_4bit_compute_dtype
-        ),
+        bnb_4bit_quant_type=cfg.bnb_4bit_quant_type,
+        bnb_4bit_use_double_quant=cfg.bnb_4bit_use_double_quant,
+        bnb_4bit_compute_dtype=cfg.bnb_4bit_compute_dtype,
         torch_dtype=cfg.torch_dtype,
-        attn_implementation=(
-            cfg.attn_implementation
-        ),
+        attn_implementation=cfg.attn_implementation,
         device_map="auto",
     )
+    base_model, processor = loader.load()
+    processor.tokenizer.padding_side = "left"
 
-    processor = loader.load_processor()
-
-    # 批量自回归生成时使用 left padding。
-    processor.tokenizer.padding_side = (
-        "left"
-    )
-
-    # =========================================================
-    # 2. BioMedCLIP
-    # =========================================================
-    biomed_extractor = None
-    biomed_transform = None
-    biomed_tokenizer = None
-
-    # A0 不需要 BioMedCLIP，其余启用 Visual Adapter 的实验加载。
-    if cfg.enable_visual_adapter:
-        (
-            biomed_extractor,
-            biomed_transform,
-            biomed_tokenizer,
-        ) = load_biomedclip(
-            biomedclip_path=(
-                cfg.biomedclip_path
-            ),
+    biomed_extractor = biomed_transform = biomed_tokenizer = None
+    if cfg.requires_biomedclip:
+        from utils.biomedclip.biomed_clip_loader import load_biomedclip
+        biomed_extractor, biomed_transform, biomed_tokenizer = load_biomedclip(
+            biomedclip_path=cfg.biomedclip_path,
             print_rank=cfg.print_rank,
         )
 
-    # =========================================================
-    # 3. SLAKE Validation DataLoader
-    # =========================================================
-    dataset = SLAKEDataset(
-        json_path=(
-            cfg.slake_val_json_path
-        ),
-        image_root=(
-            cfg.slake_image_root
-        ),
-    )
+    kwargs = cfg.wrapper_kwargs(biomed_extractor=biomed_extractor)
+    # 评测只做 inference，不需要 gradient checkpointing。
+    kwargs["gradient_checkpointing"] = False
+    model = Qwen3VLLoraAndCMDASSMWrapper(**kwargs).wrap(base_model)
 
+    _load_lora_strict(model, checkpoint)
+    restore_visual_adapter_strict(model, cfg=cfg, directory=checkpoint)
+    model.requires_grad_(False)
+    if hasattr(model, "gradient_checkpointing_disable"):
+        model.gradient_checkpointing_disable()
+    model.config.use_cache = True
+    model.eval()
+
+    if cfg.requires_biomedclip:
+        _install_generation_forward(model)
+
+    return model, processor, biomed_transform, biomed_tokenizer
+
+
+def _create_loader(cfg: Stage2EvalConfig, processor, transform, tokenizer, split: str):
+    path = (
+        cfg.slake_val_json_path if split == "validation"
+        else cfg.slake_test_json_path
+    )
+    dataset = SLAKEDataset(json_path=path, image_root=cfg.slake_image_root)
+    if len(dataset) == 0:
+        raise RuntimeError(f"SLAKE {split} 数据集为空。")
     collator = SLAKEEvalCollator(
         processor=processor,
         cfg=cfg,
-        biomed_transform=(
-            biomed_transform
-        ),
-        biomed_tokenizer=(
-            biomed_tokenizer
-        ),
+        biomed_transform=transform,
+        biomed_tokenizer=tokenizer,
     )
-
-    val_loader = DataLoader(
+    return DataLoader(
         dataset,
-        batch_size=(
-            cfg.per_device_eval_batch_size
-        ),
+        batch_size=cfg.per_device_eval_batch_size,
         collate_fn=collator,
-        num_workers=(
-            cfg.dataloader_num_workers
-        ),
+        num_workers=cfg.dataloader_num_workers,
         shuffle=False,
     )
 
-    # =========================================================
-    # 4. LLM Judge
-    # =========================================================
-    llm_cfg = LLMAPIConfig()
 
-    llm_client = DeepSeekClient.from_config(
-        llm_cfg
+def get_llm_judge(strict_only: bool):
+    """保留原 MoRA-Med 的 DeepSeek Judge 协议；离线排查可禁用。"""
+    if strict_only:
+        return None, None
+    from config.LLM_config import LLMAPIConfig
+    from LLM_api.deepseek import DeepSeekClient
+    cfg = LLMAPIConfig()
+    return DeepSeekClient.from_config(cfg), cfg
+
+
+def judge_records(records: list[dict], llm_client, llm_config) -> None:
+    """与原脚本相同：OPEN 且严格匹配失败时调用 LLM 判定。"""
+    if llm_client is None:
+        return
+    from LLM_api.prompts.slake_prompt_builder_deepseek import (
+        build_llm_judge_user_prompt,
+        parse_llm_judge_response,
     )
 
-    print(
-        "LLM Judge："
-        f"model={llm_cfg.judge_model_name}, "
-        "thinking=disabled, "
-        f"temperature={llm_cfg.temperature}"
-    )
-
-    # =========================================================
-    # 5. 逐 checkpoint 评测
-    # =========================================================
-    results = [
-        evaluate_checkpoint(
-            path,
-            loader,
-            processor,
-            cfg,
-            val_loader,
-            llm_client,
-            llm_cfg,
-            biomed_extractor,
+    for row in tqdm(records, desc="SLAKE LLM Judge"):
+        if row["question_category"] != "open" or row["is_norm_match"]:
+            continue
+        prompt = build_llm_judge_user_prompt(
+            question=row["question"],
+            gt_raw=row["gt_raw"],
+            gt_norm=row["gt_norm"],
+            pred_raw=row["pred_raw"],
+            pred_norm=row["pred_norm"],
         )
-        for path in checkpoints
-    ]
+        response = llm_client.ask(
+            llm_config.medical_vqa_llm_judge_system_prompt, prompt,
+        )
+        parsed = parse_llm_judge_response(response)
+        row["llm_judge_raw_response"] = response
+        row["llm_judge_score"] = parsed.get("score")
+        row["llm_judge_reason"] = (
+            parsed.get("reasoning") or parsed.get("reason")
+            or parsed.get("explanation")
+        )
+        row["final_correct"] = parsed.get("score") == "correct"
 
-    # 保存所有 checkpoint 的汇总排行榜。
-    leaderboard_path = os.path.join(
-        cfg.validation_output_dir,
-        "leaderboard.json",
-    )
 
-    with open(
-        leaderboard_path,
-        "w",
-        encoding="utf-8",
+def calculate_metrics(records: list[dict], cfg: Stage2EvalConfig) -> dict:
+    if not records:
+        raise RuntimeError("没有可评估的 SLAKE 样本。")
+    closed = [row for row in records if row["question_category"] == "closed"]
+    opened = [row for row in records if row["question_category"] == "open"]
+    correct = lambda rows: sum(bool(row["final_correct"]) for row in rows)
+    metrics = {
+        "metric_protocol": (
+            "strict_only" if cfg.strict_only else "strict_plus_deepseek_judge"
+        ),
+        "closed_count": len(closed),
+        "open_count": len(opened),
+        "closed_acc": correct(closed) / len(closed) if closed else None,
+        "open_strict_acc": correct(opened) / len(opened) if opened else None,
+        "overall_strict_acc": correct(records) / len(records),
+    }
+    diagnostics = [row for row in records if row.get("lambda_value") is not None]
+    if diagnostics:
+        metrics["routing"] = {
+            f"mean_{name.lower()}": sum(
+                float(row[f"direction_{name.lower()}"]) for row in diagnostics
+            ) / len(diagnostics)
+            for name in DIAGNOSTIC_DIRECTIONS
+        }
+        for metric in (
+            "lambda_value", "rho", "lambda_times_rho",
+            "injected_residual_rms", "routing_entropy_normalized",
+        ):
+            metrics["routing"][f"mean_{metric}"] = sum(
+                float(row[metric]) for row in diagnostics
+            ) / len(diagnostics)
+    return metrics
+
+
+def write_results(folder: Path, records: list[dict], summary: dict) -> None:
+    folder.mkdir(parents=True, exist_ok=True)
+    with (folder / "samples.jsonl").open("w", encoding="utf-8") as file:
+        for row in records:
+            file.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with (folder / "samples.csv").open(
+        "w", encoding="utf-8-sig", newline=""
     ) as file:
-        json.dump(
-            results,
-            file,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    # =========================================================
-    # 6. 终端输出排行榜
-    # =========================================================
-    print(
-        "\n\n"
-        + "🏆" * 20
-        + " SLAKE 评测结果 "
-        + "🏆" * 20
+        writer = csv.DictWriter(file, fieldnames=list(records[0]))
+        writer.writeheader()
+        writer.writerows(records)
+    (folder / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
 
-    print(
-        f"| 评测节点 "
-        f"({cfg.ablation_id}) "
-        "| Closed Acc "
-        "| Open Acc "
-        "| Overall Acc |"
+
+def evaluate_checkpoint(
+    checkpoint: Path,
+    cfg: Stage2EvalConfig,
+    *,
+    split: str,
+    llm_client,
+    llm_cfg,
+) -> dict:
+    """对 Validation 或 Test 单个 checkpoint 执行完整生成与评测。"""
+    if split not in {"validation", "test"}:
+        raise ValueError(f"未知评测 split：{split}")
+    validate_stage2_checkpoint(checkpoint, cfg)
+    output_root = Path(
+        cfg.validation_output_dir if split == "validation"
+        else cfg.test_output_dir
     )
-
-    print(
-        "| :--- | :---: "
-        "| :---: | :---: |"
+    output = output_root / checkpoint.name
+    print(f"\n🔎 SLAKE {split} · {checkpoint.name}")
+    model, processor, transform, tokenizer = build_model_for_checkpoint(
+        cfg, checkpoint
     )
+    loader = _create_loader(cfg, processor, transform, tokenizer, split)
+    adapter = get_visual_adapter(model)
+    vision = model.base_model.model.model.visual
+    device = next(vision.parameters()).device
 
-    for result in results:
-        print(
-            f"| {result['checkpoint']} "
-            f"| {result['closed_acc']:.2%} "
-            f"| {result['open_strict_acc']:.2%} "
-            f"| {result['overall_strict_acc']:.2%} |"
-        )
+    holder = None
+    original_adapter_forward = None
+    if adapter is not None:
+        holder, original_adapter_forward = _enable_adapter_diagnostics(adapter)
 
-    best = max(
-        results,
-        key=lambda item: (
-            item["overall_strict_acc"]
-        ),
-    )
+    records: list[dict] = []
+    try:
+        with torch.inference_mode():
+            for inputs, metadata in tqdm(loader, desc=f"SLAKE {split}"):
+                inputs = {
+                    key: value.to(device) if isinstance(value, torch.Tensor) else value
+                    for key, value in inputs.items()
+                }
+                if holder is not None:
+                    holder["details"] = []
+                # 每个生成 batch 都必须清空图文条件，防止前一个 batch 泄漏。
+                vision.current_biomed_img_feat = None
+                vision.current_biomed_txt_feat = None
 
-    best_checkpoint = {
-        "dataset": "SLAKE",
-        "selection_split": "validation",
-        "selection_metric": "overall_strict_acc",
-        "selected_checkpoint": (
-            best["checkpoint"]
-        ),
-        "selected_checkpoint_path": (
-            best["checkpoint_path"]
-        ),
-        "validation_score": (
-            best["overall_strict_acc"]
-        ),
+                try:
+                    if cfg.requires_biomedclip:
+                        image = inputs.pop("biomed_image_tensors")
+                        text = inputs.pop("biomed_text_tokens")
+                        biomed_model = model.biomed_extractor
+                        reference = next(biomed_model.parameters())
+                        image = image.to(reference.device, dtype=reference.dtype)
+                        text = text.to(reference.device)
+                        image_feat, text_feat = biomed_model(image, text)
+                        vision.current_biomed_img_feat = image_feat.detach()
+                        vision.current_biomed_txt_feat = text_feat.detach()
+
+                    generate_kwargs: dict[str, Any] = {
+                        "max_new_tokens": cfg.max_new_tokens,
+                        "do_sample": cfg.do_sample,
+                    }
+                    if cfg.do_sample:
+                        generate_kwargs["temperature"] = cfg.temperature
+
+                    generated = model.generate(**inputs, **generate_kwargs)
+                    new_tokens = [
+                        output_ids[len(input_ids):]
+                        for input_ids, output_ids in zip(inputs["input_ids"], generated)
+                    ]
+                    predictions = processor.batch_decode(
+                        new_tokens,
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                    if len(predictions) != len(metadata):
+                        raise RuntimeError("SLAKE 解码数量与样本数量不一致。")
+
+                    # 一条样本仅对应一张图；四方向统计必须逐图对应。
+                    details = holder["details"] if holder is not None else []
+                    if adapter is not None and len(details) != len(metadata):
+                        raise RuntimeError(
+                            "四方向诊断与 SLAKE 样本数不一致；"
+                            f"details={len(details)}, batch={len(metadata)}"
+                        )
+
+                    for index, (prediction, meta) in enumerate(
+                        zip(predictions, metadata)
+                    ):
+                        gt_raw = str(meta.get("gt_answer", meta.get("answer", "")))
+                        gt_norm = slake_answer_eval_cleaning(gt_raw)
+                        pred_norm = slake_answer_eval_cleaning(prediction)
+                        matched = gt_norm == pred_norm
+                        category = (
+                            "closed" if str(meta.get("answer_type", ""))
+                            .strip().upper() == "CLOSED" else "open"
+                        )
+                        row = {
+                            "index": meta.get("index"),
+                            "image_path": meta.get("image_path"),
+                            "question": meta["question"],
+                            "question_category": category,
+                            "gt_raw": gt_raw,
+                            "gt_norm": gt_norm,
+                            "pred_raw": prediction.strip(),
+                            "pred_norm": pred_norm,
+                            "is_norm_match": matched,
+                            "llm_judge_score": None,
+                            "llm_judge_reason": None,
+                            "llm_judge_raw_response": None,
+                            "final_correct": matched,
+                        }
+                        # 所有样本具有同一组 CSV 列，避免 DictWriter 键不一致。
+                        diagnostic_keys = [
+                            *(f"direction_{d.lower()}" for d in DIAGNOSTIC_DIRECTIONS),
+                            "lambda_value", "rho", "lambda_times_rho",
+                            "injected_residual_rms", "routing_entropy",
+                            "routing_entropy_normalized",
+                        ]
+                        row.update({key: None for key in diagnostic_keys})
+                        if adapter is not None:
+                            row.update(_stats_for_image(details[index]))
+                        records.append(row)
+                finally:
+                    vision.current_biomed_img_feat = None
+                    vision.current_biomed_txt_feat = None
+    finally:
+        if adapter is not None:
+            adapter.forward = original_adapter_forward
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    judge_records(records, llm_client=llm_client, llm_config=llm_cfg)
+    result = {
+        "checkpoint": checkpoint.name,
+        "checkpoint_path": str(checkpoint.resolve()),
+        "split": split,
         "ablation_id": cfg.ablation_id,
         "seed": cfg.seed,
         "stage1_seed": cfg.stage1_seed,
+        **calculate_metrics(records, cfg),
     }
+    write_results(output, records, result)
+    print(
+        f"✅ {checkpoint.name} · Overall: {result['overall_strict_acc']:.4%} "
+        f"· Protocol: {result['metric_protocol']}"
+    )
+    return result
 
-    with open(
-        cfg.best_checkpoint_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            best_checkpoint,
-            file,
-            ensure_ascii=False,
-            indent=2,
+
+def main():
+    options = read_options()
+    cfg = Stage2EvalConfig(strict_only=options.strict_only)
+    checkpoints = discover_checkpoints(cfg)
+    print("Validation 候选 checkpoint：", [item.name for item in checkpoints])
+    if options.check_config_only:
+        print("✅ Validation 配置与所有 checkpoint manifest 通过预检")
+        return
+
+    llm_client, llm_cfg = get_llm_judge(cfg.strict_only)
+    results = [
+        evaluate_checkpoint(
+            item, cfg, split="validation",
+            llm_client=llm_client, llm_cfg=llm_cfg,
         )
-
-    print(
-        f"\n最佳节点："
-        f"{best['checkpoint']} "
-        f"(Overall: "
-        f"{best['overall_strict_acc']:.2%})"
+        for item in checkpoints
+    ]
+    root = Path(cfg.validation_output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "leaderboard.json").write_text(
+        json.dumps(results, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
     )
 
-    print(
-        f"评测输出目录："
-        f"{cfg.validation_output_dir}"
+    # 仅使用 Validation 指标选最佳，Test 绝不可参与选点。
+    best = max(results, key=lambda x: x["overall_strict_acc"])
+    selected = {
+        "dataset": "SLAKE",
+        "selection_split": "validation",
+        "selection_metric": "overall_strict_acc",
+        "metric_protocol": best["metric_protocol"],
+        "selected_checkpoint": best["checkpoint"],
+        "selected_checkpoint_path": best["checkpoint_path"],
+        "validation_score": best["overall_strict_acc"],
+        "ablation_id": cfg.ablation_id,
+        "architecture_fingerprint": cfg.architecture_fingerprint,
+        "seed": cfg.seed,
+        "stage1_seed": cfg.stage1_seed,
+        "run_tag": cfg.run_tag,
+    }
+    Path(cfg.best_checkpoint_path).write_text(
+        json.dumps(selected, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
-
-    print(
-        f"排行榜："
-        f"{leaderboard_path}"
-    )
+    print("🎉 Validation 选出的最佳 checkpoint：", best["checkpoint"])
+    print("最佳节点记录：", cfg.best_checkpoint_path)
 
 
 if __name__ == "__main__":

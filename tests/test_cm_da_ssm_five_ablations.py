@@ -63,7 +63,7 @@ def make_adapter(abl="A3", dim=32, *, zero_init_up=True):
         query_dim=8,
         biomedclip_image_encoder_dim=512,
         biomedclip_text_encoder_dim=512,
-        eta=1.0,
+        eta=cfg.eta,
         eta_mode="fixed",
         lambda_init=cfg.lambda_init,
         residual_norm_eps=cfg.residual_norm_eps,
@@ -133,7 +133,7 @@ class TestAblationConfig(unittest.TestCase):
                     ),
                     tup,
                 )
-                self.assertEqual(cfg.lambda_init, 0.2)
+                self.assertEqual(cfg.lambda_init, 0.4)
 
     def test_all_four_stage2_configs_inherit_own_stage1(self):
         for abl in ABLATION_IDS:
@@ -341,7 +341,7 @@ class TestForwardAblations(unittest.TestCase):
                 name == "lambda_a"
                 for name,_ in model.named_parameters()
             ))
-            self.assertAlmostEqual(model._compute_lambda().item(),0.2,places=6)
+            self.assertAlmostEqual(model._compute_lambda().item(),0.4,places=6)
             self.assertIn("fixed_lambda",model.state_dict())
 
     def test_a3_a3_no_rms_learnable_lambda_parameter(self):
@@ -349,7 +349,7 @@ class TestForwardAblations(unittest.TestCase):
             model=make_adapter(abl,zero_init_up=False)
             self.assertIsInstance(model.lambda_a,nn.Parameter)
             self.assertTrue(model.lambda_a.requires_grad)
-            self.assertAlmostEqual(model._compute_lambda().item(),0.2,places=6)
+            self.assertAlmostEqual(model._compute_lambda().item(),0.4,places=6)
             self.assertIn("lambda_a",model.state_dict())
             self.assertNotIn("fixed_lambda",model.state_dict())
 
@@ -384,7 +384,7 @@ class TestForwardAblations(unittest.TestCase):
 
         self.assertEqual(off_stats[0]["rho"].item(),1.0)
         self.assertAlmostEqual(
-            (off_out-tiny_x).mean().item(),0.4,places=4,
+            (off_out-tiny_x).mean().item(),0.8,places=4,
         )
         self.assertGreater(a3_stats[0]["rho"].item(),1.0)
         self.assertGreater(

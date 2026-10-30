@@ -17,9 +17,9 @@ class SLAKETrainCollator:
 
     主要职责：
     1. 为 Qwen3-VL 构造图像问答对话；
-    2. 为 RoMA-Net V2-lite 构造 BioMedCLIP 图像和问题输入；
+    2. 为 CM-RADF 构造 BioMedCLIP 图像和问题输入；
     3. 只对 assistant 的答案计算语言模型损失；
-    4. A0 不生成 BioMedCLIP 输入，A1～A5 生成。
+    4. 仅 A2/A3/A3-NoRMS 生成 BioMedCLIP 输入；A0/A1 不生成。
     """
 
     def __init__(
@@ -32,7 +32,15 @@ class SLAKETrainCollator:
         self.processor = processor
         self.max_size = int(cfg.slake_max_size)
         self.instruction_suffix = cfg.slake_instruction_suffix
-        self.enable_visual_adapter = bool(cfg.enable_visual_adapter)
+        # A1 使用 Uniform Fusion + 4D-SSM，但没有 BioMedCLIP。
+        # 因此不能使用 enable_visual_adapter 作为条件输入开关。
+        self.requires_biomedclip = bool(cfg.requires_biomedclip)
+
+        if self.requires_biomedclip and cfg.biomed_condition_text_mode != "question":
+            raise ValueError(
+                "SLAKE Stage 2 的 BioMedCLIP 条件必须是当前问题，"
+                "不能使用标签答案或 Stage 1 的报告指令。"
+            )
 
         if self.processor.tokenizer.padding_side != "right":
             raise ValueError(
@@ -43,7 +51,7 @@ class SLAKETrainCollator:
         self.biomed_img_transform = biomed_transform
         self.biomed_tokenizer = biomed_tokenizer
 
-        if self.enable_visual_adapter:
+        if self.requires_biomedclip:
             if self.biomed_img_transform is None:
                 raise ValueError(
                     "enable_visual_adapter=True，"
@@ -178,7 +186,7 @@ class SLAKETrainCollator:
                 image_path
             )
 
-            if self.enable_visual_adapter:
+            if self.requires_biomedclip:
                 biomed_image = self.biomed_img_transform(
                     original_image
                 )
@@ -259,7 +267,7 @@ class SLAKETrainCollator:
                     f"样本索引：{index}"
                 )
 
-        if self.enable_visual_adapter:
+        if self.requires_biomedclip:
             batch_inputs["biomed_image_tensors"] = (
                 torch.stack(
                     biomed_images,

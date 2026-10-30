@@ -15,8 +15,11 @@ class SLAKEEvalCollator:
     A0：
         只构造 Qwen3-VL 输入。
 
-    A1～A5：
-        同时构造 Qwen3-VL 与 BioMedCLIP 输入。
+    A1：
+        四方向 SSM + Uniform Fusion，不构造 BioMedCLIP 输入。
+
+    A2/A3/A3-NoRMS：
+        同时构造 Qwen3-VL 与冻结 BioMedCLIP 输入。
     """
 
     def __init__(
@@ -29,9 +32,11 @@ class SLAKEEvalCollator:
         self.processor = processor
         self.max_size = int(cfg.slake_max_size)
         self.instruction_suffix = cfg.slake_instruction_suffix
-        self.enable_visual_adapter = bool(
-            cfg.enable_visual_adapter
+        self.requires_biomedclip = bool(
+            cfg.requires_biomedclip
         )
+        if self.requires_biomedclip and cfg.biomed_condition_text_mode != "question":
+            raise ValueError("SLAKE 评测的 BioMedCLIP 只能使用当前问题文本。")
 
         if self.processor.tokenizer.padding_side != "left":
             raise ValueError(
@@ -42,16 +47,16 @@ class SLAKEEvalCollator:
         self.biomed_img_transform = biomed_transform
         self.biomed_tokenizer = biomed_tokenizer
 
-        if self.enable_visual_adapter:
+        if self.requires_biomedclip:
             if self.biomed_img_transform is None:
                 raise ValueError(
-                    "enable_visual_adapter=True，"
+                    "requires_biomedclip=True，"
                     "但没有传入 biomed_transform。"
                 )
 
             if self.biomed_tokenizer is None:
                 raise ValueError(
-                    "enable_visual_adapter=True，"
+                    "requires_biomedclip=True，"
                     "但没有传入 biomed_tokenizer。"
                 )
 
@@ -161,7 +166,7 @@ class SLAKEEvalCollator:
                 image_path
             )
 
-            if self.enable_visual_adapter:
+            if self.requires_biomedclip:
                 biomed_image = self.biomed_img_transform(
                     original_image
                 )
@@ -219,7 +224,7 @@ class SLAKEEvalCollator:
             padding=True,
         )
 
-        if self.enable_visual_adapter:
+        if self.requires_biomedclip:
             batch_inputs["biomed_image_tensors"] = (
                 torch.stack(
                     biomed_images,
