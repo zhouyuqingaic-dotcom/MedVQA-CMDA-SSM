@@ -2,7 +2,6 @@
 CM-DA-SSM 所需的视觉 token 切分和 BiomedCLIP 先验工具。
 
 重要：
-    用户上传的最新 CM-DA-SSM.zip 已不包含旧版
     qwen3_vl_8B_visual_adapters_fusion_utils.py，
     但 Step 2/3 仍然导入其中三个函数。
 
