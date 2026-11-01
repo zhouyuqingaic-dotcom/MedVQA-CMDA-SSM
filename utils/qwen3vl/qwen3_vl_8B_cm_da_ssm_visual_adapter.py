@@ -17,7 +17,7 @@ from utils.qwen3vl.qwen3_vl_8B_cm_da_ssm_utils import (
 # CM-DA-SSM Visual Residual Adapter
 #
 # 计算流程：
-#   Pooled Visual Tokens X
+#   One Merger-level visual stream X (pooled or DeepStack)
 #       -> Four-Directional SSM
 #       -> Global–Local CM-RADF
 #       -> Shared Up
@@ -27,15 +27,15 @@ from utils.qwen3vl.qwen3_vl_8B_cm_da_ssm_utils import (
 #       -> Enhanced Pooled Tokens X'
 #
 # 约束：
-#   1. 本模块只接收并返回 pooled visual tokens；
-#   2. DeepStack 不传进来，也不在这里修改；
+#   1. 本模块对一条 Merger 后视觉流进行残差增强；
+#   2. Wrapper 对 pooled 与 DeepStack 逐条调用同一个实例；
 #   3. 不再使用旧 MoRA-Med 的 Scale Router 或 Soft Gate；
 #   4. 每个视觉条目分别计算 RMS，不跨图像混合；
 #   5. Shared Up 零初始化时 R=0，因此 X'=X（精确恒等）。
 # =====================================================================
 class Qwen3VLCMDASSMVisualAdapter(nn.Module):
     """
-    CM-DA-SSM pooled-only 视觉残差适配器，支持四组视觉分支消融。
+    CM-DA-SSM 单条视觉流的残差适配器，由 Wrapper 共享到 pooled 和 DeepStack。
 
     与原 MoRA-Med 的 Adapter 前向输入风格保持一致：
 
@@ -434,7 +434,7 @@ class Qwen3VLCMDASSMVisualAdapter(nn.Module):
             可选：
                 enhanced_x, details_per_image
 
-        这里从始至终不读取 / 不修改 DeepStack features。
+        本函数只处理本次传入的一条流；DeepStack 由 Wrapper 分别调用。
         """
         if x is None or x.ndim not in (2, 3):
             raise ValueError(

@@ -12,7 +12,7 @@ CM-DA-SSM Stage 1 · MIMIC-CXR / IMPRESSION
     1. 五组从相同 Qwen3-VL 基座开始各自独立的 Stage 1；
     2. A0/A1 不加载 BioMedCLIP；A2/A3/A3-NoRMS 才加载；
     3. 对所有样本监督报告 IMPRESSION，不向 BioMedCLIP 泄露目标；
-    4. 全部组只增强 pooled_tokens，DeepStack 由 Qwen 原生输出；
+    4. A1/A2/A3/A3-NoRMS 共享 Adapter 同时增强 pooled 与 DeepStack，A0 不挂载；
     5. 用新版优化器严格验证每组的可训练参数；
     6. 每个 Trainer checkpoint 保存 LoRA + Visual Adapter + manifest；
     7. 可精确断点续训，禁止跨组/跨 seed/跨 run_tag 恢复；
@@ -572,7 +572,7 @@ def main():
             f"Lambda={cfg.lambda_mode}, "
             f"RMS={cfg.use_rms_norm}, "
             f"BiomedCLIP={cfg.requires_biomedclip}, "
-            f"DeepStack=False",
+            f"DeepStack={cfg.adapt_deepstack and cfg.enable_visual_adapter}",
             print_rank=cfg.print_rank,
         )
         ddp_print("=" * 72, print_rank=cfg.print_rank)

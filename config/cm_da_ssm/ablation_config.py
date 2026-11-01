@@ -185,9 +185,10 @@ class CMDASSMCommonConfig:
     use_rms_norm: bool = field(init=False)
     requires_biomedclip: bool = field(init=False)
 
-    # 这两个约束是算法固定要求。
+    # 新版固定要求：A1/A2/A3/A3-NoRMS 共用 pooled + DeepStack。
+    # A0 不挂载 Adapter；这两个字段记录结构协议，保障架构指纹隔离。
     adapt_pooled_tokens: bool = field(default=True, init=False)
-    adapt_deepstack: bool = field(default=False, init=False)
+    adapt_deepstack: bool = field(default=True, init=False)
 
     # =========================================================
     # 8. 训练策略：五组默认同一任务预算与数据
@@ -362,7 +363,7 @@ class CMDASSMCommonConfig:
         因此 ablation_id 与 use_rms_norm 均属于架构指纹。
         """
         return {
-            "version": "CM-DA-SSM-5AB-V1",
+            "version": "CM-DA-SSM-5AB-PooledDeepStack-V2",
             "ablation_id": self.ablation_id,
             "model_name_or_path": self.model_name_or_path,
             "lora_r": self.lora_r,
@@ -486,7 +487,8 @@ class CMDASSMCommonConfig:
             )
             fragments.append(
                 f"UpZero{int(self.zero_init_up)}"
-                f"-PooledOnly{int(self.adapt_pooled_tokens)}"
+                f"-Pooled{int(self.adapt_pooled_tokens)}"
+                f"-DeepStack{int(self.adapt_deepstack)}"
             )
 
         fragments.append(

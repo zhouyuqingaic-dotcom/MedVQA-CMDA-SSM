@@ -11,7 +11,7 @@
   - 只使用 Qwen3VLLoraAndCMDASSMWrapper，加载新的 LoRA + visual_adapter.pt；
   - BioMedCLIP 仅在 A2/A3/A3-NoRMS 使用；A1 是 Uniform Fusion；
   - 记录四方向 RF/RR/CF/CR、全局 λ、逐图 ρ 和注入幅度；
-  - DeepStack 依旧由 Qwen3-VL 原生处理，不参与 CM-DA-SSM。
+  - pooled + 三条 DeepStack 共享同一 CM-DA-SSM Adapter，按流记录诊断。
 
 诊断的捕捉通过 eval 期间临时包装 Adapter.forward(return_details=True)
 实现；它不修改模型参数或 forward 的输出张量。正式训练无需该包装。
@@ -174,14 +174,18 @@ def _install_generation_forward(model) -> None:
 
 
 def _enable_adapter_diagnostics(adapter):
-    """只在推理时捕捉四方向诊断，保留原 Adapter 的输出 Tensor。"""
+    """记录同一个 Adapter 的连续四条流：pooled，DeepStack 0/1/2。
+
+    每次视觉前向会复用 adapter.forward 四次。绝不能用最后一次
+    DeepStack 诊断覆盖 pooled；按 Adapter 调用顺序逐流追加。
+    """
     original = adapter.forward
-    holder: dict[str, list[dict]] = {"details": []}
+    holder: dict[str, list] = {"streams": []}
 
     def wrapped(self, *args, **kwargs):
         kwargs.pop("return_details", None)
         enhanced, details = original(*args, return_details=True, **kwargs)
-        holder["details"] = [
+        holder["streams"].append([
             {
                 "routing_weights": value["routing_weights"].detach().float().cpu(),
                 "rho": value["rho"].detach().float().cpu(),
@@ -189,7 +193,7 @@ def _enable_adapter_diagnostics(adapter):
                 "delta_rms": value["delta_rms"].detach().float().cpu(),
             }
             for value in details
-        ]
+        ])
         return enhanced
 
     adapter.forward = types.MethodType(wrapped, adapter)
@@ -220,6 +224,17 @@ def _stats_for_image(detail: dict) -> dict:
         "routing_entropy_normalized": float(entropy.item() / math.log(4)),
     })
     return result
+
+
+def _diagnostic_field_names(prefix: str = "") -> list[str]:
+    """生成 pooled/DeepStack 一致的逐样本诊断字段。"""
+    names = [
+        *(f"direction_{d.lower()}" for d in DIAGNOSTIC_DIRECTIONS),
+        "lambda_value", "rho", "lambda_times_rho",
+        "injected_residual_rms", "routing_entropy",
+        "routing_entropy_normalized",
+    ]
+    return [f"{prefix}_{name}" if prefix else name for name in names]
 
 
 def build_model_for_checkpoint(cfg: Stage2EvalConfig, checkpoint: Path):
@@ -369,6 +384,24 @@ def calculate_metrics(records: list[dict], cfg: Stage2EvalConfig) -> dict:
             metrics["routing"][f"mean_{metric}"] = sum(
                 float(row[metric]) for row in diagnostics
             ) / len(diagnostics)
+    # 新增多层诊断不改变既有 routing 字段：其含义固定为 pooled。
+    # DeepStack 0/1/2 的指标单独归档，避免被误当成 pooled 注入统计。
+    by_stream = {}
+    for stream_index in range(3):
+        prefix = f"deepstack_{stream_index}"
+        selected = [
+            row for row in records
+            if row.get(f"{prefix}_lambda_value") is not None
+        ]
+        if not selected:
+            continue
+        by_stream[prefix] = {
+            f"mean_{name}": sum(float(row[f"{prefix}_{name}"]) for row in selected)
+            / len(selected)
+            for name in _diagnostic_field_names()
+        }
+    if by_stream:
+        metrics["routing_by_stream"] = by_stream
     return metrics
 
 
@@ -429,7 +462,7 @@ def evaluate_checkpoint(
                     for key, value in inputs.items()
                 }
                 if holder is not None:
-                    holder["details"] = []
+                    holder["streams"] = []
                 # 每个生成 batch 都必须清空图文条件，防止前一个 batch 泄漏。
                 vision.current_biomed_img_feat = None
                 vision.current_biomed_txt_feat = None
@@ -466,13 +499,26 @@ def evaluate_checkpoint(
                     if len(predictions) != len(metadata):
                         raise RuntimeError("SLAKE 解码数量与样本数量不一致。")
 
-                    # 一条样本仅对应一张图；四方向统计必须逐图对应。
-                    details = holder["details"] if holder is not None else []
-                    if adapter is not None and len(details) != len(metadata):
-                        raise RuntimeError(
-                            "四方向诊断与 SLAKE 样本数不一致；"
-                            f"details={len(details)}, batch={len(metadata)}"
-                        )
+                    # 一条 SLAKE 样本对应一张图；每条流都应具有
+                    # 与当前 batch 一一对齐的单图诊断。
+                    streams = holder["streams"] if holder is not None else []
+                    count = len(getattr(vision, "deepstack_visual_indexes", (0, 1, 2)))
+                    stream_names = ("pooled",) + tuple(
+                        f"deepstack_{i}" for i in range(count)
+                    )
+                    if adapter is not None:
+                        if len(streams) != len(stream_names):
+                            raise RuntimeError(
+                                "共享 Adapter 诊断流数量不匹配："
+                                f"actual={len(streams)}, expected={len(stream_names)} "
+                                f"({stream_names})"
+                            )
+                        if any(len(details) != len(metadata) for details in streams):
+                            raise RuntimeError(
+                                "多流四方向诊断与 SLAKE 样本数不一致；"
+                                f"stream_counts={[len(d) for d in streams]}, "
+                                f"batch={len(metadata)}"
+                            )
 
                     for index, (prediction, meta) in enumerate(
                         zip(predictions, metadata)
@@ -500,16 +546,19 @@ def evaluate_checkpoint(
                             "llm_judge_raw_response": None,
                             "final_correct": matched,
                         }
-                        # 所有样本具有同一组 CSV 列，避免 DictWriter 键不一致。
-                        diagnostic_keys = [
-                            *(f"direction_{d.lower()}" for d in DIAGNOSTIC_DIRECTIONS),
-                            "lambda_value", "rho", "lambda_times_rho",
-                            "injected_residual_rms", "routing_entropy",
-                            "routing_entropy_normalized",
-                        ]
+                        # pooled 使用原有列名；其余三条流单独加前缀。
+                        # 保持每个样本 CSV 列集合相同。
+                        diagnostic_keys = _diagnostic_field_names()
+                        for name in stream_names[1:]:
+                            diagnostic_keys.extend(_diagnostic_field_names(name))
                         row.update({key: None for key in diagnostic_keys})
                         if adapter is not None:
-                            row.update(_stats_for_image(details[index]))
+                            row.update(_stats_for_image(streams[0][index]))
+                            for stream_index, name in enumerate(stream_names[1:], start=1):
+                                for key, val in _stats_for_image(
+                                    streams[stream_index][index]
+                                ).items():
+                                    row[f"{name}_{key}"] = val
                         records.append(row)
                 finally:
                     vision.current_biomed_img_feat = None

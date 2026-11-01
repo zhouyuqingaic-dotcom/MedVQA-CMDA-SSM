@@ -4,8 +4,8 @@ CM-DA-SSM Stage 2 — SLAKE。
 五组消融每组独立继承自己 Stage 1 MIMIC-CXR 检查点；
 不允许 A3-NoRMS 读取 A3，也不允许任何组借用其他组权重。
 
-该文件目前是新训练配置；原 Trainer 后续还需同步切换 Wrapper、
-Optimizer 和 Stage 1 Checkpoint 加载路径。
+当前 Trainer、Wrapper、Optimizer、Stage 1 Checkpoint 与多层视觉适配
+使用同一套结构指纹及权重协议。
 """
 
 import argparse

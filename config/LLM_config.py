@@ -15,7 +15,7 @@ class LLMAPIConfig:
 
     deepseek_api_key: str = os.environ.get(
         "DEEPSEEK_API_KEY",
-        "sk-b7551356501f4f4b9421dcb62de6cd0a",
+        "sk-09198a68741b4dd48c6b0a708ac036a7",
     )
 
     judge_model_name: str = os.environ.get(

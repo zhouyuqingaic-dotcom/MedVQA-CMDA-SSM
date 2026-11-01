@@ -72,250 +72,145 @@ class FrozenBioMedCLIPFeatureExtractor(nn.Module):
 
 
 # =====================================================================
-# 视觉塔 forward patch：只注入 pooled visual tokens
+# 视觉塔 forward patch：共享 CM-DA-SSM 同时增强 pooled + DeepStack
 # =====================================================================
-def install_cm_da_ssm_pooled_only_vision_patch(
+def install_cm_da_ssm_vision_patch(
     vision_tower: nn.Module,
     visual_adapter: Qwen3VLCMDASSMVisualAdapter,
 ):
+    """在 Qwen3-VL Vision Merger 后对全部四条视觉流共享同一个 Adapter。
+
+    常规 Qwen3-VL：pooler_output + 三条 deepstack_features；
+    均为 Merger 后的 [N, D] 视觉 token。保留原视觉返回类型，
+    让 LLM 沿原生路径在输入处使用 pooled，在前几个 Decoder 层注入 DeepStack。
+
+    A1 为 Uniform Fusion（不需 BioMedCLIP）；A2/A3/A3-NoRMS 共用
+    当前 batch 的 BioMedCLIP 条件。四次调用同一模块，不复制参数。
+
+    目前 SSM 网格切分基于 spatial_merge_size=2，遇到其它配置直接报错。
     """
-    在已有 Qwen3-VL Vision Tower 上挂载完整的 CM-DA-SSM。
-
-    这一步严格遵循原 MoRA-Med 的挂载位置：
-        vision_tower.res_adapter = ...
-
-    同时修改 vision_tower.forward：
-        1. 原生 Qwen Vision Encoder 先正常执行；
-        2. 取得 merger 后的 pooled tokens（支持对象与二元组）；
-        3. 只把 pooled tokens 传入 CM-DA-SSM；
-        4. 将输出 X' 回填到原生输出结构的 pooled 位置；
-        5. 按原生格式返回（ModelOutput / tuple / list）。
-
-    本函数不会对原生 DeepStack：
-        - 调用任何新模块；
-        - 进行 DeepStack 列表重建；
-        - 执行 clone / detach；
-        - 修改其对象引用。
-
-    因此 DeepStack 张量及容器的身份、数值、梯度路径
-    均由原生 Qwen3-VL 决定，不会被本 patch 改变。
-
-    返回：
-        被原地打补丁的同一个 vision_tower 对象。
-
-    注意：
-        不支持重复打补丁，也不覆盖已经存在的旧版 res_adapter。
-        在同一模型实例上切换旧 / 新架构应重新构建 Qwen3-VL。
-    """
-    if getattr(vision_tower, "_cm_da_ssm_pooled_only_patched", False):
-        raise RuntimeError(
-            "当前 Vision Tower 已经安装 CM-DA-SSM patch，"
-            "请勿重复挂载。"
-        )
-
+    if getattr(vision_tower, "_cm_da_ssm_vision_patched", False):
+        raise RuntimeError("当前 Vision Tower 已安装 CM-DA-SSM patch，禁止重复挂载。")
     if hasattr(vision_tower, "res_adapter"):
         raise RuntimeError(
-            "当前 Vision Tower 已存在 res_adapter，"
-            "请使用全新的 Qwen3-VL 模型实例安装 CM-DA-SSM，"
-            "避免与旧 MoRA-Med forward patch 冲突。"
+            "Vision Tower 已存在 res_adapter，请新建 Qwen3-VL 模型实例，"
+            "避免覆盖原有视觉模块。"
         )
-
     if not isinstance(visual_adapter, nn.Module):
-        raise TypeError(
-            "visual_adapter 必须是 nn.Module。"
-        )
+        raise TypeError("visual_adapter 必须是 nn.Module。")
 
-    # 挂到视觉塔下，确保 adapter 参数被 PEFT / PyTorch 追踪，
-    # 并使原项目 visual.res_adapter 的保存路径仍然有效。
+    # 一份 Adapter 参数，训练与保存仍使用原有 visual.res_adapter 路径。
     vision_tower.res_adapter = visual_adapter
-
-    # 保存未注入前的真正 Qwen3-VL 原生 vision forward。
     vision_tower.original_forward = vision_tower.forward
-
-    # 默认不缓存任何前一个 batch 的条件特征。
     vision_tower.current_biomed_img_feat = None
     vision_tower.current_biomed_txt_feat = None
 
     def patched_vision_forward(self, *args, **kwargs):
-        """
-        每次 Qwen 视觉塔前向执行：
+        outputs = self.original_forward(*args, **kwargs)
+        img_f = getattr(self, "current_biomed_img_feat", None)
+        txt_f = getattr(self, "current_biomed_txt_feat", None)
 
-        native vision -> pooled-only CM-DA-SSM -> native DeepStack
-
-        DeepStack 不传给 res_adapter，也不重新赋值。
-        """
-        # ============================================================
-        # 1. 保持 Qwen3-VL Vision Encoder 原生计算
-        # ============================================================
-        outputs = self.original_forward(
-            *args,
-            **kwargs,
-        )
-
-        # ============================================================
-        # 2. 查找当前 batch 的 BioMedCLIP 条件特征
-        # ============================================================
-        img_f = getattr(
-            self,
-            "current_biomed_img_feat",
-            None,
-        )
-
-        txt_f = getattr(
-            self,
-            "current_biomed_txt_feat",
-            None,
-        )
-
-        # A1 的 Uniform Fusion 根本不使用 BiomedCLIP Query，
-        # 所以 A1 允许二者均为 None，A2/A3 则必须提供完整先验。
         if (
             self.res_adapter.fusion_mode == "cm_radf"
             and (img_f is None or txt_f is None)
         ):
             raise ValueError(
-                "CM-DA-SSM 视觉塔已启用，但当前视觉前向没有 "
-                "BioMedCLIP 图像/文本特征。"
-                "训练时请传 biomed_image_tensors 和 biomed_text_tokens；"
-                "generate() 时请先计算特征并注入 Vision Tower 缓存。"
+                "CM-RADF 当前前向缺少 BioMedCLIP 图像/文本特征；"
+                "训练请传 biomed_image_tensors/biomed_text_tokens，"
+                "生成时应先为 Vision Tower 缓存两组特征。"
             )
 
-        # ============================================================
-        # 3. 查找 Qwen 原生 grid_thw
-        # ============================================================
-        #
-        # 对齐原 MoRA-Med Wrapper：
-        #   grid_thw 可在 keyword 参数或第二个位置参数中。
-        grid_thw = kwargs.get(
-            "grid_thw",
-            None,
-        )
-
+        grid_thw = kwargs.get("grid_thw")
         if grid_thw is None and len(args) > 1:
             grid_thw = args[1]
-
         if grid_thw is None:
-            raise ValueError(
-                "CM-DA-SSM 视觉前向没有拿到 grid_thw。"
+            raise ValueError("CM-DA-SSM 视觉前向没有 grid_thw。")
+
+        merge_size = getattr(self, "spatial_merge_size", None)
+        if merge_size is None:
+            merge_size = getattr(getattr(self, "config", None), "spatial_merge_size", 2)
+        if merge_size != 2:
+            raise RuntimeError(
+                f"当前 4D-SSM grid split 仅支持 spatial_merge_size=2，实际={merge_size}。"
+                "请先同步修改 visual_token_split，不能静默使用错误空间网格。"
             )
 
-        # ============================================================
-        # 4. 只处理原生 pooled visual tokens
-        # ============================================================
-        #
-        # merged/pooler tokens:
-        #   [N_total, D] 或 [1, N_total, D]
-        #
-        # 原生 DeepStack features：
-        #   不参与 SSM；
-        #   不参与 CM-RADF；
-        #   不参与 RMS 校准；
-        #   不参与残差注入；
-        #   不修改对象引用。
-        # Qwen3-VL 不同 Transformers 版本的 Vision Tower
-        # 返回接口并不相同：
-        #
-        #   当前训练环境：
-        #       (merged_hidden_states, deepstack_feature_lists)
-        #
-        #   另一些版本：
-        #       BaseModelOutputWithDeepstackFeatures(
-        #           pooler_output=merged_hidden_states,
-        #           deepstack_features=deepstack_feature_lists,
-        #       )
-        #
-        # 无论哪种接口，只允许增强 merger 后的 pooled tokens；
-        # DeepStack 列表及其中各张量必须保持原生对象引用。
         if hasattr(outputs, "pooler_output"):
             output_format = "model_output"
-            pooled_tokens = outputs.pooler_output
+            pooled = outputs.pooler_output
+            deepstack = getattr(outputs, "deepstack_features", None)
         elif isinstance(outputs, (tuple, list)):
-            if (
-                len(outputs) != 2
-                or not isinstance(outputs[0], torch.Tensor)
-                or not isinstance(outputs[1], (tuple, list))
-            ):
-                raise RuntimeError(
-                    "不支持的 Qwen3-VL Vision tuple/list 输出："
-                    f"type={type(outputs).__name__}, "
-                    f"len={len(outputs)}。预期为 "
-                    "(pooled_tokens, deepstack_features)。"
-                )
-            output_format = (
-                "tuple" if isinstance(outputs, tuple) else "list"
-            )
-            pooled_tokens = outputs[0]
+            if len(outputs) != 2:
+                raise RuntimeError("Qwen Vision tuple/list 输出必须为 (pooled, deepstack)。")
+            output_format = "tuple" if isinstance(outputs, tuple) else "list"
+            pooled, deepstack = outputs
         else:
             raise RuntimeError(
-                "当前 Qwen3-VL Vision 输出不包含 pooler_output，"
-                "也不是 (pooled_tokens, deepstack_features) 二元组；"
-                f"实际类型：{type(outputs).__name__}。"
+                "当前 Vision Tower 返回类型不支持："
+                f"{type(outputs).__name__}。"
             )
 
-        if (
-            not isinstance(pooled_tokens, torch.Tensor)
-            or pooled_tokens.ndim not in (2, 3)
-        ):
+        if not isinstance(pooled, torch.Tensor) or pooled.ndim not in (2, 3):
+            raise RuntimeError("pooler_output 必须为 [N,D] 或 [1,N,D] Tensor。")
+        if not isinstance(deepstack, (list, tuple)) or not deepstack:
             raise RuntimeError(
-                "Qwen Vision pooled tokens 类型或维度不正确："
-                f"type={type(pooled_tokens).__name__}, "
-                f"shape={getattr(pooled_tokens, 'shape', None)}。"
+                "必须提供非空 deepstack_features 列表，"
+                "本实验不允许跳过 DeepStack 适配。"
             )
 
-        # 这是整个 wrapper 里唯一的一次 res_adapter 前向。
-        enhanced_pooled_tokens = self.res_adapter(
-            pooled_tokens,
-            biomed_img_feat=img_f,
-            biomed_txt_feat=txt_f,
-            grid_thw=grid_thw,
-        )
-
-        if (
-            enhanced_pooled_tokens.shape
-            != pooled_tokens.shape
-        ):
+        indexes = getattr(self, "deepstack_visual_indexes", None)
+        if indexes is not None and len(indexes) != len(deepstack):
             raise RuntimeError(
-                "CM-DA-SSM 改变了 pooled visual token 的形状："
-                f"before={tuple(pooled_tokens.shape)}, "
-                f"after={tuple(enhanced_pooled_tokens.shape)}"
+                f"DeepStack 层数量不匹配：config={len(indexes)}, "
+                f"实际={len(deepstack)}。"
             )
 
-        if (
-            enhanced_pooled_tokens.dtype
-            != pooled_tokens.dtype
-        ):
-            raise RuntimeError(
-                "CM-DA-SSM 改变了 pooled visual token dtype："
-                f"before={pooled_tokens.dtype}, "
-                f"after={enhanced_pooled_tokens.dtype}"
-            )
+        # 先验证所有流的 Merger 后结构，避免某条支路失败时悄悄跳过。
+        for i, feature in enumerate(deepstack):
+            if (
+                not isinstance(feature, torch.Tensor)
+                or feature.shape != pooled.shape
+                or feature.dtype != pooled.dtype
+            ):
+                raise RuntimeError(
+                    f"DeepStack[{i}] 和 pooled 特征无法共享 Adapter："
+                    f"pooled={tuple(pooled.shape)}/{pooled.dtype}; "
+                    f"deepstack={getattr(feature, 'shape', None)}/"
+                    f"{getattr(feature, 'dtype', None)}。"
+                )
 
-        # ============================================================
-        # 5. 唯一需要更新的视觉输出字段
-        # ============================================================
+        def adapt_one(feature, label):
+            enhanced = self.res_adapter(
+                feature,
+                biomed_img_feat=img_f,
+                biomed_txt_feat=txt_f,
+                grid_thw=grid_thw,
+            )
+            if enhanced.shape != feature.shape or enhanced.dtype != feature.dtype:
+                raise RuntimeError(
+                    f"{label} 增强后 shape/dtype 变化："
+                    f"before={tuple(feature.shape)}/{feature.dtype}, "
+                    f"after={tuple(enhanced.shape)}/{enhanced.dtype}"
+                )
+            return enhanced
+
+        # 固定顺序：pooled -> DeepStack 0/1/2；评测也按这个顺序记录。
+        enhanced_pooled = adapt_one(pooled, "pooler_output")
+        enhanced_deepstack = [
+            adapt_one(feature, f"deepstack_{i}")
+            for i, feature in enumerate(deepstack)
+        ]
+
         if output_format == "model_output":
-            outputs.pooler_output = enhanced_pooled_tokens
+            outputs.pooler_output = enhanced_pooled
+            outputs.deepstack_features = enhanced_deepstack
             return outputs
-
-        # 当前 transformers 版本直接解包视觉塔的二元组。
-        # 因此必须保留原生的二元组/列表格式：
-        #
-        #   image_embeds, deepstack_image_embeds = self.visual(...)
-        #
-        # 只替换第 0 项（pooled tokens），第 1 项 DeepStack
-        # 不进行 clone、detach、转换或重建，保证其对象身份不变。
         if output_format == "tuple":
-            return (enhanced_pooled_tokens, outputs[1])
+            return enhanced_pooled, enhanced_deepstack
+        return [enhanced_pooled, enhanced_deepstack]
 
-        return [enhanced_pooled_tokens, outputs[1]]
-
-    vision_tower.forward = types.MethodType(
-        patched_vision_forward,
-        vision_tower,
-    )
-
-    vision_tower._cm_da_ssm_pooled_only_patched = True
-
+    vision_tower.forward = types.MethodType(patched_vision_forward, vision_tower)
+    vision_tower._cm_da_ssm_vision_patched = True
     return vision_tower
 
 
@@ -354,11 +249,11 @@ def install_cm_da_ssm_biomed_forward_patch(
 
     if not getattr(
         vision_tower,
-        "_cm_da_ssm_pooled_only_patched",
+        "_cm_da_ssm_vision_patched",
         False,
     ):
         raise RuntimeError(
-            "请先挂载 pooled-only Vision Tower patch，"
+            "请先挂载 pooled + DeepStack Vision Tower patch，"
             "再安装 BioMedCLIP forward patch。"
         )
 
@@ -445,7 +340,7 @@ def install_cm_da_ssm_biomed_forward_patch(
             )
 
         finally:
-            # 仅清除条件缓存，不触碰任何 DeepStack tensor。
+            # 仅清除 BioMedCLIP 条件缓存，不影响增强后的 DeepStack。
             visual.current_biomed_img_feat = None
             visual.current_biomed_txt_feat = None
 
@@ -468,26 +363,22 @@ class Qwen3VLLoraAndCMDASSMWrapper:
 
     完整计算：
         Frozen Qwen3-VL Vision Encoder
-            -> pooled tokens X + native DeepStack
-            -> CM-DA-SSM(X, BioMedCLIP(I,Q))
-            -> X' = X + lambda*rho*R
-            -> Qwen3-VL LLM + LoRA
+            -> pooler_output + DeepStack 0/1/2
+            -> 同一 CM-DA-SSM Adapter 依次处理四条视觉流
+            -> 各流 X' = X + lambda*rho*R
+            -> Qwen3-VL 原生 LLM 注入路径 + LoRA
 
     重要设计：
         - Frozen Qwen backbone + 可训练 LoRA；
         - 四方向 SSM / CM-RADF / Shared Up 可训练；
         - learnable lambda 可训练；
         - BioMedCLIP 完全冻结；
-        - DeepStack 完全保留原样；
+        - pooled 与 DeepStack 共享同一个 Adapter，不复制模型参数；
         - 不包含旧三卷积专家/样本 Soft Gate；
         - 返回的依旧是 PeftModel，可以供 Trainer 使用。
 
-    注意：
-        此类与原 MoRA-Med 的 Qwen3VLLoraAndVisualAdapterWrapper
-        并行存在，不覆盖旧代码，保证旧基线可复现。
-
-        旧 Trainer 的 scale_mode/gate_mode 等参数不能原样传入，
-        必须在后续训练迁移时更新配置与优化器分组。
+    注意：该结构替换本工程原单路径视觉适配版本；旧版由 Git 历史保存。
+    Stage 1/2 必须使用相同的新版结构指纹。
     """
 
     def __init__(
@@ -735,7 +626,7 @@ class Qwen3VLLoraAndCMDASSMWrapper:
             f"eta={self.eta}, "
             f"lambda_init={self.lambda_init}, "
             f"rho_max={self.residual_norm_ratio_clip}, "
-            "adapt_deepstack=False"
+            "adapt_deepstack=True (shared adapter)"
         )
 
         # ============================================================
@@ -782,9 +673,9 @@ class Qwen3VLLoraAndCMDASSMWrapper:
         )
 
         # ============================================================
-        # 5. 第一重 Patch：Vision Tower pooled-only
+        # 5. 第一重 Patch：Vision Tower pooled + DeepStack
         # ============================================================
-        install_cm_da_ssm_pooled_only_vision_patch(
+        install_cm_da_ssm_vision_patch(
             vision_tower=vision_tower,
             visual_adapter=visual_adapter,
         )
@@ -796,7 +687,7 @@ class Qwen3VLLoraAndCMDASSMWrapper:
             # A1 不需要 BioMedCLIP。因此不注册冻结编码器，
             # 并且移除 Collator 可能携带的额外图文参数。
             #
-            # Vision patch 仍只更新 pooled tokens，DeepStack 不变。
+            # Vision patch 同时更新 pooled 与 DeepStack。
             self._patch_forward_to_drop_biomed_kwargs(
                 peft_model
             )
@@ -817,15 +708,15 @@ class Qwen3VLLoraAndCMDASSMWrapper:
             )
 
         ddp_print(
-            "✅ [CM-DA-SSM] pooled-only 视觉残差适配器挂载成功。"
+            "✅ [CM-DA-SSM] pooled + DeepStack 共享视觉适配器挂载成功。"
         )
 
         ddp_print(
-            "    Enhanced: pooler_output"
+            "    Enhanced: pooler_output (shared res_adapter)"
         )
 
         ddp_print(
-            "    Unmodified: deepstack_features"
+            "    Enhanced: deepstack_features (same res_adapter, 3 passes)"
         )
 
         if hasattr(peft_model, "print_trainable_parameters"):
